@@ -1,7 +1,7 @@
 let state = {
   q: "",
   sourceKey: "",
-  limit: 50,
+  limit: 200,
   offset: 0,
   total: 0,
   items: [],
@@ -34,7 +34,70 @@ async function fetchJson(url) {
   return await res.json();
 }
 
+function hasOfflineBundle() {
+  return typeof window !== "undefined" && window.PROMPTDB && Array.isArray(window.PROMPTDB.items);
+}
+
+function offlineBundle() {
+  return window.PROMPTDB;
+}
+
+let OFFLINE = {
+  ready: false,
+  items: [],
+  byId: new Map(),
+  sources: [],
+  total: 0,
+};
+
+function initOffline() {
+  const b = offlineBundle();
+  const items = (b.items || []).map((p) => ({
+    id: Number(p.id),
+    title: p.title || "",
+    body: p.body || "",
+    source: p.source || "",
+    source_repo: p.source_repo || "",
+    source_path: p.source_path || "",
+    _t: (p.title || "").toLowerCase(),
+    _b: (p.body || "").toLowerCase(),
+  }));
+
+  items.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" }));
+
+  const byId = new Map();
+  for (const it of items) byId.set(it.id, it);
+
+  let sources = b.sources;
+  if (!Array.isArray(sources) || sources.length === 0) {
+    const counts = new Map();
+    for (const it of items) {
+      const key = `${it.source}|${it.source_repo}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    sources = Array.from(counts.entries())
+      .map(([key, count]) => {
+        const parsed = parseSourceKey(key);
+        return { source: parsed.source, repo: parsed.repo, count };
+      })
+      .sort((a, b) => (b.count || 0) - (a.count || 0));
+  }
+
+  OFFLINE = {
+    ready: true,
+    items,
+    byId,
+    sources,
+    total: Number(b.total || items.length),
+  };
+}
+
 async function loadStats() {
+  if (hasOfflineBundle()) {
+    $("subtitle").textContent = `${OFFLINE.total} prompts`;
+    return;
+  }
+
   try {
     const stats = await fetchJson("/api/stats");
     $("subtitle").textContent = `${stats.total} prompts`;
@@ -60,14 +123,29 @@ function labelForSource(source, repo, count) {
 
 async function loadSources() {
   const sel = $("source");
+
+  // Keep the first option (All sources)
+  sel.querySelectorAll("option").forEach((opt, i) => {
+    if (i > 0) opt.remove();
+  });
+
+  if (hasOfflineBundle()) {
+    for (const it of OFFLINE.sources) {
+      const source = it.source || "";
+      const repo = it.repo || "";
+      const count = it.count || 0;
+      const key = `${source}|${repo}`;
+      const opt = document.createElement("option");
+      opt.value = key;
+      opt.textContent = labelForSource(source, repo, count);
+      sel.appendChild(opt);
+    }
+    return;
+  }
+
   try {
     const data = await fetchJson("/api/sources");
     const items = data.items || [];
-
-    // Keep the first option (All sources)
-    sel.querySelectorAll("option").forEach((opt, i) => {
-      if (i > 0) opt.remove();
-    });
 
     for (const it of items) {
       const source = it.source || "";
@@ -84,7 +162,53 @@ async function loadSources() {
   }
 }
 
+function offlineFilterAll() {
+  let items = OFFLINE.items;
+  if (state.sourceKey) {
+    const parsed = parseSourceKey(state.sourceKey);
+    items = items.filter((it) => {
+      if (parsed.source && it.source !== parsed.source) return false;
+      if (parsed.repo && it.source_repo !== parsed.repo) return false;
+      return true;
+    });
+  }
+
+  const q = (state.q || "").trim().toLowerCase();
+  if (q) {
+    items = items.filter((it) => it._t.includes(q) || it._b.includes(q));
+  }
+  return items;
+}
+
 async function loadList() {
+  if (hasOfflineBundle()) {
+    const filtered = offlineFilterAll();
+    state.total = filtered.length;
+
+    const start = Math.max(0, state.offset);
+    const end = Math.min(start + state.limit, filtered.length);
+    state.items = filtered.slice(start, end).map((it) => ({
+      id: it.id,
+      title: it.title,
+      source: it.source,
+      source_repo: it.source_repo,
+    }));
+
+    renderList();
+    renderPager();
+
+    if (state.items.length > 0) {
+      const visibleIds = new Set(state.items.map((x) => x.id));
+      if (state.selectedId == null || !visibleIds.has(state.selectedId)) {
+        await selectPrompt(state.items[0].id);
+      }
+    } else {
+      renderEmptyDetail();
+    }
+
+    return;
+  }
+
   const params = new URLSearchParams();
   if (state.q) params.set("q", state.q);
   if (state.sourceKey) {
@@ -172,6 +296,21 @@ async function selectPrompt(id) {
   state.selectedId = id;
   renderList();
 
+  if (hasOfflineBundle()) {
+    const p = OFFLINE.byId.get(id);
+    if (!p) {
+      $("promptTitle").textContent = "Not found";
+      $("promptMeta").textContent = "";
+      $("promptBody").textContent = "This prompt id is not in the offline bundle.";
+      return;
+    }
+    $("promptTitle").textContent = p.title;
+    const meta = [p.source, p.source_repo, p.source_path].filter(Boolean).join(" • ");
+    $("promptMeta").textContent = meta;
+    $("promptBody").textContent = p.body;
+    return;
+  }
+
   const p = await fetchJson(`/api/prompts/${id}`);
   $("promptTitle").textContent = p.title;
 
@@ -237,6 +376,12 @@ function wireEvents() {
 }
 
 async function main() {
+  if (hasOfflineBundle()) {
+    initOffline();
+  } else {
+    // Helpful hint when running index.html directly without generating data.js first
+    $("subtitle").textContent = "offline bundle missing";
+  }
   wireEvents();
   await loadSources();
   await loadStats();
